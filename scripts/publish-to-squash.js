@@ -41,10 +41,21 @@ function stripXmlTags(value = '') {
 }
 
 function extractSquashReference(testName) {
-  const match = testName.match(/\[SQUASH:([^\]]+)\]/);
-  if (!match) return null;
+  // Format 1:
+  // [SQUASH:PLX-PW-TAB-001]
+  const squashMatch = testName.match(/\[SQUASH:([^\]]+)\]/i);
+  if (squashMatch) {
+    return squashMatch[1].trim();
+  }
 
-  return match[1].trim();
+  // Format 2:
+  // Add new Tablet Code @PLX-PW-TAB-001
+  const atTagMatch = testName.match(/@([A-Z0-9]+(?:-[A-Z0-9]+)+)/i);
+  if (atTagMatch) {
+    return atTagMatch[1].trim();
+  }
+
+  return null;
 }
 
 function parseJUnit(xml) {
@@ -62,7 +73,7 @@ function parseJUnit(xml) {
     const reference = extractSquashReference(testName);
 
     if (!reference) {
-      console.warn(`SKIP: Test "${testName}" tidak punya tag [SQUASH:...]`);
+      console.warn(`SKIP: Test "${testName}" tidak punya tag [SQUASH:...] atau @REFERENCE`);
       continue;
     }
 
