@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-test('Add new Tablet Code @PLX-PW-TAB-001', async ({ page }) => {
+test('[SQUASH_ITPI:268] Add new Tablet Code', async ({ page }) => {
   await page.goto('https://test.pmmp-abs.com/dpsSJIC/main/index.jsp');
   await page.getByRole('textbox', { name: 'Enter Username' }).click();
   await page.getByRole('textbox', { name: 'Enter Username' }).fill('it@test.com');
@@ -20,7 +20,7 @@ test('Add new Tablet Code @PLX-PW-TAB-001', async ({ page }) => {
   await expect(successMessage).toBeVisible({ timeout: 30000 });
 });
 
-test('Delete Tablet Code @PLX-PW-TAB-002', async ({ page }) => {
+test('[SQUASH_ITPI:269] Delete Tablet Code @PLX-PW-TAB-002', async ({ page }) => {
   await page.goto('https://test.pmmp-abs.com/dpsSJIC/main/');
   await page.getByRole('textbox', { name: 'Enter Username' }).click();
   await page.getByRole('textbox', { name: 'Enter Username' }).fill('it@test.com');
