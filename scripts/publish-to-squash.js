@@ -84,6 +84,29 @@ function parseJUnit(xml) {
   return results;
 }
 
+async function getItpiStatus(itpiId) {
+  const base = SQUASH_URL.replace(/\/+$/, '');
+  const url = `${base}/api/rest/latest/iteration-test-plan-items/${itpiId}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${SQUASH_TOKEN}`,
+      'Content-Type': 'application/json'
+    }
+  });
+
+  const body = await response.text();
+
+  if (!response.ok) {
+    console.error(`FAILED GET ITPI ${itpiId}, HTTP ${response.status}`);
+    console.error(body);
+    throw new Error(`Failed to get ITPI ${itpiId}`);
+  }
+
+  return JSON.parse(body);
+}
+
 async function patchItpiStatus(itpiId, status) {
   const base = SQUASH_URL.replace(/\/+$/, '');
   const url = `${base}/api/rest/latest/iteration-test-plan-items/${itpiId}`;
@@ -106,17 +129,25 @@ async function patchItpiStatus(itpiId, status) {
 
   const responseBody = await response.text();
 
-  if (response.ok) {
-    console.log(`OK: ITPI ${itpiId} updated to ${status}`);
-    return;
-  }
-
-  console.error(`FAILED: ITPI ${itpiId}, HTTP ${response.status}`);
+  console.log(`PATCH response HTTP ${response.status}`);
   if (responseBody) {
-    console.error(responseBody);
+    console.log(`PATCH response body: ${responseBody}`);
   }
 
-  throw new Error(`Failed to update ITPI ${itpiId}`);
+  if (!response.ok) {
+    throw new Error(`Failed to update ITPI ${itpiId}`);
+  }
+
+  const updated = await getItpiStatus(itpiId);
+  console.log(`AFTER PATCH ITPI ${itpiId} execution_status = ${updated.execution_status}`);
+
+  if (updated.execution_status !== status) {
+    throw new Error(
+      `ITPI ${itpiId} not updated. Expected ${status}, actual ${updated.execution_status}`
+    );
+  }
+
+  console.log(`OK: ITPI ${itpiId} verified as ${status}`);
 }
 
 async function main() {
