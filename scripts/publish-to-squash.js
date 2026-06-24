@@ -109,17 +109,17 @@ async function getItpiStatus(itpiId) {
 
 async function patchItpiStatus(itpiId, status) {
   const base = SQUASH_URL.replace(/\/+$/, '');
-  const url = `${base}/api/rest/latest/iteration-test-plan-items/${itpiId}`;
+  const url = `${base}/backend/test-plan-item/${itpiId}/execution-status`;
 
   const payload = {
-    _type: 'iteration-test-plan-item',
-    execution_status: status
+    executionStatus: status
   };
 
-  console.log(`PATCH ITPI ${itpiId} => ${status}`);
+  console.log(`POST ITPI ${itpiId} => ${status}`);
+  console.log(`URL: ${url}`);
 
   const response = await fetch(url, {
-    method: 'PATCH',
+    method: 'POST',
     headers: {
       Authorization: `Bearer ${SQUASH_TOKEN}`,
       'Content-Type': 'application/json'
@@ -129,9 +129,9 @@ async function patchItpiStatus(itpiId, status) {
 
   const responseBody = await response.text();
 
-  console.log(`PATCH response HTTP ${response.status}`);
+  console.log(`POST response HTTP ${response.status}`);
   if (responseBody) {
-    console.log(`PATCH response body: ${responseBody}`);
+    console.log(`POST response body: ${responseBody}`);
   }
 
   if (!response.ok) {
@@ -139,7 +139,7 @@ async function patchItpiStatus(itpiId, status) {
   }
 
   const updated = await getItpiStatus(itpiId);
-  console.log(`AFTER PATCH ITPI ${itpiId} execution_status = ${updated.execution_status}`);
+  console.log(`AFTER POST ITPI ${itpiId} execution_status = ${updated.execution_status}`);
 
   if (updated.execution_status !== status) {
     throw new Error(
