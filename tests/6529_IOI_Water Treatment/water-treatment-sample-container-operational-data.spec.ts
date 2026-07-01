@@ -23,7 +23,7 @@ test('[TC-129] Category dropdown should contain exactly five Water Treatment cat
       'Softener Water Analysis',
       'Feed Water Analysis',
       'Boiler Water Analysis',
-      'Effluent Water Analysis',
+      'Effluent Water Analysis 12',
     ]);
   });
 });
