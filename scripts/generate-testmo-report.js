@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const nodemailer = require('nodemailer');
 
 function parseJunitResults(xml) {
@@ -83,6 +84,87 @@ function parseRecipients(value) {
     .split(/[;,]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function extractTestmoRunUrl(output) {
+  const match = output.match(/https?:\/\/[^\s"'<>]+\/automation\/runs(?:\/view)?\/\d+\b/i);
+  return match ? match[0] : null;
+}
+
+function findTestmoCmd(env) {
+  if (env.TESTMO_CMD && fs.existsSync(env.TESTMO_CMD)) {
+    return env.TESTMO_CMD;
+  }
+
+  if (env.NPM_GLOBAL_PREFIX) {
+    const candidates = [
+      path.join(env.NPM_GLOBAL_PREFIX, 'testmo.cmd'),
+      path.join(env.NPM_GLOBAL_PREFIX, 'bin', 'testmo.cmd'),
+      path.join(env.NPM_GLOBAL_PREFIX, 'node_modules', '.bin', 'testmo.cmd'),
+      path.join(env.NPM_GLOBAL_PREFIX, 'node_modules', '@testmo', 'testmo-cli', 'bin', 'testmo.cmd'),
+      path.join(env.NPM_GLOBAL_PREFIX, 'node_modules', '@testmo', 'testmo-cli', 'bin', 'testmo'),
+    ];
+
+    for (const candidate of candidates) {
+      if (candidate && fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return 'npx';
+}
+
+function publishTestmoResults(env = process.env) {
+  if (!env.TESTMO_PROJECT_ID || !env.TESTMO_URL || !env.TESTMO_SOURCE || !env.JUNIT_FILE) {
+    console.warn('Skipping Testmo publish: TESTMO_PROJECT_ID, TESTMO_URL, TESTMO_SOURCE, or JUNIT_FILE is missing.');
+    return null;
+  }
+
+  const testmoCmd = findTestmoCmd(env);
+  const args = [
+    'automation:run:submit',
+    '--instance', env.TESTMO_URL,
+    '--project-id', env.TESTMO_PROJECT_ID,
+    '--name', `${env.TESTMO_RUN_NAME || 'Automation Run'} - Build ${env.BUILD_NUMBER || env.BUILD_ID || 'local'}`,
+    '--source', env.TESTMO_SOURCE,
+    '--results', env.JUNIT_FILE,
+  ];
+
+  if (testmoCmd === 'npx') {
+    args.unshift('@testmo/testmo-cli');
+  }
+
+  const childEnv = {
+    ...process.env,
+    ...env,
+    TESTMO_TOKEN: env.TESTMO_TOKEN || process.env.TESTMO_TOKEN,
+    PATH: process.env.PATH,
+  };
+
+  try {
+    console.log('Publishing results to Testmo...');
+    const output = execFileSync(testmoCmd, args, {
+      env: childEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    console.log(output);
+    const url = extractTestmoRunUrl(output);
+    if (url) {
+      console.log(`Detected Testmo run URL: ${url}`);
+      return url;
+    }
+
+    console.warn('Testmo publish succeeded, but no run URL was detected in output.');
+    return env.TESTMO_RUN_URL || env.TESTMO_URL;
+  } catch (error) {
+    console.error('Testmo publish failed:', error.message || error);
+    console.error(error.stdout ? error.stdout.toString() : '');
+    console.error(error.stderr ? error.stderr.toString() : '');
+    throw new Error('Failed to publish results to Testmo.');
+  }
 }
 
 function getEmailConfig(env = process.env) {
@@ -263,6 +345,9 @@ async function sendEmailReport(content, data, env = process.env) {
     } : undefined,
   });
 
+  console.log(`SMTP host=${env.SMTP_HOST} port=${env.SMTP_PORT} secure=${env.SMTP_SECURE}`);
+  console.log(`Email from=${emailConfig.from} to=${emailConfig.to.join(', ')} cc=${emailConfig.cc.join(', ')}`);
+
   try {
     await transporter.verify();
   } catch (error) {
@@ -301,6 +386,13 @@ async function main() {
   const duration = process.env.TESTMO_DURATION || process.env.TEST_DURATION || '00:00:00';
   const testmoUrl = process.env.TESTMO_RUN_URL || process.env.TESTMO_URL || 'https://yourcompany.testmo.net/automation/runs/2541';
 
+  if (!process.env.TESTMO_RUN_URL && process.env.TESTMO_URL) {
+    console.warn('WARNING: TESTMO_RUN_URL is not configured. The report will use TESTMO_URL root instead of a specific run view URL.');
+    console.warn('Set TESTMO_RUN_URL to the actual run view link, e.g. https://test525252.testmo.net/automation/runs/view/9');
+  }
+
+  console.log(`Default Testmo URL: ${testmoUrl}`);
+
   if (!fs.existsSync(junitPath)) {
     console.warn(`JUnit file not found at ${junitPath}; creating empty report.`);
   }
@@ -308,6 +400,18 @@ async function main() {
   const xml = fs.existsSync(junitPath) ? fs.readFileSync(junitPath, 'utf8') : '<testsuites />';
   const parsed = parseJunitResults(xml);
   const subjectPrefix = process.env.REPORT_SUBJECT_PREFIX || (parsed.failed > 0 ? '🔴 [FAILED]' : '🟢 [PASSED]');
+
+  let resolvedTestmoUrl = testmoUrl;
+  try {
+    const publishedUrl = publishTestmoResults(process.env);
+    if (publishedUrl) {
+      resolvedTestmoUrl = publishedUrl;
+    }
+  } catch (error) {
+    console.error('Testmo publish failed. Email will still be sent with the default or provided Testmo URL.');
+    console.error(error.message || error);
+  }
+
   const data = buildReportData({
     projectName,
     buildNumber,
@@ -315,7 +419,7 @@ async function main() {
     executionDate,
     duration,
     testResults: parsed.testResults,
-    testmoUrl,
+    testmoUrl: resolvedTestmoUrl,
     subjectPrefix,
   });
 
