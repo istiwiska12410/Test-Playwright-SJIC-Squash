@@ -115,6 +115,22 @@ function findTestmoCmd(env) {
   return 'npx';
 }
 
+function extendPathWithGlobalPrefix(env) {
+  const newEnv = { ...env };
+  if (env.NPM_GLOBAL_PREFIX) {
+    const separator = process.platform === 'win32' ? ';' : ':';
+    const npmBin = path.join(env.NPM_GLOBAL_PREFIX, 'bin');
+    const npmDotBin = path.join(env.NPM_GLOBAL_PREFIX, 'node_modules', '.bin');
+    const entries = [npmBin, npmDotBin].filter(Boolean);
+    const currentPath = env.PATH || process.env.PATH || '';
+    const extra = entries.filter((entry) => !currentPath.includes(entry)).join(separator);
+    if (extra) {
+      newEnv.PATH = `${extra}${separator}${currentPath}`;
+    }
+  }
+  return newEnv;
+}
+
 function publishTestmoResults(env = process.env) {
   if (!env.TESTMO_PROJECT_ID || !env.TESTMO_URL || !env.TESTMO_SOURCE || !env.JUNIT_FILE) {
     console.warn('Skipping Testmo publish: TESTMO_PROJECT_ID, TESTMO_URL, TESTMO_SOURCE, or JUNIT_FILE is missing.');
@@ -135,16 +151,26 @@ function publishTestmoResults(env = process.env) {
     args.unshift('@testmo/testmo-cli');
   }
 
+  const envWithPath = extendPathWithGlobalPrefix(env);
   const childEnv = {
     ...process.env,
-    ...env,
+    ...envWithPath,
     TESTMO_TOKEN: env.TESTMO_TOKEN || process.env.TESTMO_TOKEN,
-    PATH: process.env.PATH,
   };
 
   try {
     console.log('Publishing results to Testmo...');
-    const output = execFileSync(testmoCmd, args, {
+    console.log(`Using Testmo command: ${testmoCmd}`);
+    console.log(`Using TESTMO_TOKEN: ${childEnv.TESTMO_TOKEN ? '***HIDDEN***' : 'MISSING'}`);
+    if (!childEnv.TESTMO_TOKEN) {
+      throw new Error('Missing TESTMO_TOKEN. Please provide Testmo API token via environment or Jenkins credentials.');
+    }
+
+    const isWindows = process.platform === 'win32';
+    const execCommand = isWindows ? 'cmd.exe' : testmoCmd;
+    const execArgs = isWindows ? ['/c', testmoCmd, ...args] : args;
+
+    const output = execFileSync(execCommand, execArgs, {
       env: childEnv,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -335,17 +361,25 @@ async function sendEmailReport(content, data, env = process.env) {
     return;
   }
 
+  const useSecure = env.SMTP_SECURE === 'true';
   const transporter = nodemailer.createTransport({
     host: env.SMTP_HOST,
     port: Number(env.SMTP_PORT || 587),
-    secure: env.SMTP_SECURE === 'true',
+    secure: useSecure,
+    requireTLS: !useSecure,
     auth: env.SMTP_USER && env.SMTP_PASS ? {
       user: env.SMTP_USER,
       pass: env.SMTP_PASS,
+      method: 'LOGIN',
     } : undefined,
+    tls: {
+      rejectUnauthorized: false,
+    },
+    logger: !!env.SMTP_DEBUG,
+    debug: !!env.SMTP_DEBUG,
   });
 
-  console.log(`SMTP host=${env.SMTP_HOST} port=${env.SMTP_PORT} secure=${env.SMTP_SECURE}`);
+  console.log(`SMTP host=${env.SMTP_HOST} port=${env.SMTP_PORT} secure=${useSecure}`);
   console.log(`Email from=${emailConfig.from} to=${emailConfig.to.join(', ')} cc=${emailConfig.cc.join(', ')}`);
 
   try {
@@ -434,6 +468,8 @@ async function main() {
       console.error('Failed to send email:', error.message || error);
       console.error(error);
     }
+  } else {
+    console.log('SEND_EMAIL is not true; skipping email send.');
   }
 }
 
