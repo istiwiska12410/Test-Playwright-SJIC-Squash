@@ -127,6 +127,15 @@ function buildReportData({
   };
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function renderReport(data) {
   const lines = [];
   lines.push('Subject');
@@ -153,7 +162,7 @@ function renderReport(data) {
   lines.push('');
   lines.push('### Testmo Report');
   lines.push('');
-  lines.push(`🔗 [${data.testmoUrl}](${data.testmoUrl})`);
+  lines.push(`🔗 ${data.testmoUrl}`);
   lines.push('');
   lines.push('## Test Case Result');
   lines.push('');
@@ -163,7 +172,7 @@ function renderReport(data) {
     const icon = test.status === 'Failed' ? '🔴' : test.status === 'Skipped' ? '🟡' : '🟢';
     const remark = test.remark || '-';
     const elapsed = test.elapsed || '00:00';
-    lines.push(`${index + 1}${test.name} ${icon} ${test.status} ${remark} ${elapsed}`);
+    lines.push(`${index + 1}. ${test.name} ${icon} ${test.status} ${remark} ${elapsed}`);
   });
 
   lines.push('');
@@ -174,12 +183,70 @@ function renderReport(data) {
   return lines.join('\n');
 }
 
+function renderHtmlReport(data) {
+  const rows = data.testResults.map((test, index) => {
+    const icon = test.status === 'Failed' ? '🔴' : test.status === 'Skipped' ? '🟡' : '🟢';
+    const statusColor = test.status === 'Failed' ? '#e74c3c' : test.status === 'Skipped' ? '#f1c40f' : '#2ecc71';
+    return `<tr style="border-bottom:1px solid #e0e0e0">
+      <td style="padding:8px;vertical-align:top">${index + 1}</td>
+      <td style="padding:8px;vertical-align:top">${escapeHtml(test.name)}</td>
+      <td style="padding:8px;vertical-align:top;color:${statusColor};font-weight:600">${icon} ${escapeHtml(test.status)}</td>
+      <td style="padding:8px;vertical-align:top">${escapeHtml(test.remark || '-')}</td>
+      <td style="padding:8px;vertical-align:top">${escapeHtml(test.elapsed || '00:00')}</td>
+    </tr>`;
+  }).join('');
+
+  const testmoLink = data.testmoUrl ? `<a href="${escapeHtml(data.testmoUrl)}">${escapeHtml(data.testmoUrl)}</a>` : '-';
+
+  return `<!doctype html>
+<html>
+  <body style="font-family:Arial,Helvetica,sans-serif;color:#333;line-height:1.5;">
+    <h2 style="margin-bottom:0.2em;">${escapeHtml(data.subject)}</h2>
+    <p>The automation execution has been completed.</p>
+
+    <h3>Execution Information</h3>
+    <table style="border-collapse:collapse;width:100%;max-width:700px;margin-bottom:16px;">
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Project</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.projectName)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Build</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.buildNumber)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Environment</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.environment)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Execution Date</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.executionDate)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Duration</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.duration)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Total Test Cases</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.totalTestCases}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Passed</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.passed}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Failed</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.failed}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Skipped</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.skipped}</td></tr>
+    </table>
+
+    <h3>Testmo Report</h3>
+    <p>${testmoLink}</p>
+
+    <h3>Test Case Result</h3>
+    <table style="border-collapse:collapse;width:100%;max-width:900px;">
+      <thead>
+        <tr style="background:#f7f7f7;text-align:left;">
+          <th style="padding:10px;border:1px solid #ddd;">No</th>
+          <th style="padding:10px;border:1px solid #ddd;">Test Case</th>
+          <th style="padding:10px;border:1px solid #ddd;">Status</th>
+          <th style="padding:10px;border:1px solid #ddd;">Remark</th>
+          <th style="padding:10px;border:1px solid #ddd;">Elapsed</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+
+    <p>Regards,<br/>Automation Bot</p>
+  </body>
+</html>`;
+}
+
 function writeReportFile(outputPath, content) {
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, content, 'utf8');
 }
 
-async function sendEmailReport(content, env = process.env) {
+async function sendEmailReport(content, data, env = process.env) {
   const emailConfig = getEmailConfig(env);
   if (!emailConfig.to.length) {
     console.warn('No email recipients configured; skipping email send.');
@@ -202,6 +269,7 @@ async function sendEmailReport(content, env = process.env) {
     cc: emailConfig.cc.join(','),
     subject: emailConfig.subject,
     text: content,
+    html: renderHtmlReport(data),
   };
 
   await transporter.sendMail(message);
@@ -226,7 +294,6 @@ async function main() {
   const executionDate = process.env.TESTMO_EXECUTION_DATE || process.env.BUILD_TIMESTAMP || new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' });
   const duration = process.env.TESTMO_DURATION || process.env.TEST_DURATION || '00:00:00';
   const testmoUrl = process.env.TESTMO_URL || process.env.TESTMO_RUN_URL || 'https://yourcompany.testmo.net/automation/runs/2541';
-  const subjectPrefix = process.env.REPORT_SUBJECT_PREFIX || (parsed.failed > 0 ? '🔴 [FAILED]' : '🟢 [PASSED]');
 
   if (!fs.existsSync(junitPath)) {
     console.warn(`JUnit file not found at ${junitPath}; creating empty report.`);
@@ -234,6 +301,7 @@ async function main() {
 
   const xml = fs.existsSync(junitPath) ? fs.readFileSync(junitPath, 'utf8') : '<testsuites />';
   const parsed = parseJunitResults(xml);
+  const subjectPrefix = process.env.REPORT_SUBJECT_PREFIX || (parsed.failed > 0 ? '🔴 [FAILED]' : '🟢 [PASSED]');
   const data = buildReportData({
     projectName,
     buildNumber,
@@ -250,7 +318,7 @@ async function main() {
   console.log(`Generated Testmo report: ${outputPath}`);
 
   if (process.env.SEND_EMAIL === 'true') {
-    await sendEmailReport(content);
+    await sendEmailReport(content, data);
   }
 }
 
