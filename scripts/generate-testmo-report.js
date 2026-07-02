@@ -128,6 +128,32 @@ function extractTestmoRunUrl(output, env = process.env) {
   return null;
 }
 
+function extractTestmoRunId(output) {
+  const text = String(output || '').replace(/\x1B\[[0-9;]*m/g, '');
+
+  const urlMatch = text.match(/\/automation\/runs(?:\/view)?\/(\d+)\b/i);
+  if (urlMatch && urlMatch[1]) return urlMatch[1];
+
+  const idPatterns = [
+    /automation\s+run\s+(?:id\s*)?[:#]?\s*(\d{1,10})/i,
+    /run\s+id\s*[:#]?\s*(\d{1,10})/i,
+    /created\s+(?:automation\s+)?run\s*(?:id)?\s*[:#]?\s*(\d{1,10})/i,
+    /run_id["'\s:=]+(\d{1,10})/i,
+    /^\s*(\d{1,10})\s*$/m,
+  ];
+
+  for (const pattern of idPatterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) return match[1];
+  }
+
+  return null;
+}
+
+function withNpxPackage(testmoCmd, args) {
+  return testmoCmd === 'npx' ? ['@testmo/testmo-cli', ...args] : args;
+}
+
 function findTestmoCmd(env = process.env) {
   if (env.TESTMO_CMD && fs.existsSync(env.TESTMO_CMD)) {
     return env.TESTMO_CMD;
@@ -184,42 +210,69 @@ function publishTestmoResults(env = process.env) {
     throw new Error('Missing TESTMO_TOKEN. Add Jenkins secret text credential with id: testmo-api-key.');
   }
 
+  if (!env.TESTMO_URL || !env.TESTMO_PROJECT_ID || !env.TESTMO_SOURCE) {
+    throw new Error('Missing TESTMO_URL, TESTMO_PROJECT_ID, or TESTMO_SOURCE.');
+  }
+
   if (!fs.existsSync(junitFile)) {
     throw new Error(`JUnit file not found: ${junitFile}`);
   }
 
   const testmoCmd = findTestmoCmd(env);
-  const args = [
-    'automation:run:submit',
-    '--instance', env.TESTMO_URL,
-    '--project-id', env.TESTMO_PROJECT_ID,
-    '--name', `${env.TESTMO_RUN_NAME || 'Automation Run'} - Build #${env.BUILD_NUMBER || env.BUILD_ID || 'local'}`,
-    '--source', env.TESTMO_SOURCE,
-    '--results', junitFile,
-  ];
+  const childEnv = {
+    ...process.env,
+    ...env,
+  };
 
-  if (testmoCmd === 'npx') {
-    args.unshift('@testmo/testmo-cli');
-  }
+  const runName = `${env.TESTMO_RUN_NAME || 'Automation Run'} - Build #${env.BUILD_NUMBER || env.BUILD_ID || 'local'}`;
 
-  console.log('Publishing results to Testmo...');
+  console.log('Publishing results to Testmo with explicit run ID flow...');
   console.log(`Using Testmo command: ${testmoCmd}`);
   console.log(`JUnit file: ${junitFile}`);
   console.log('TESTMO_TOKEN: ***HIDDEN***');
 
-  const output = runCommand(testmoCmd, args, {
-    ...process.env,
-    ...env,
-  });
+  // 1) Create run first so we can reliably get the run ID.
+  const createOutput = runCommand(testmoCmd, withNpxPackage(testmoCmd, [
+    'automation:run:create',
+    '--instance', env.TESTMO_URL,
+    '--project-id', env.TESTMO_PROJECT_ID,
+    '--name', runName,
+    '--source', env.TESTMO_SOURCE,
+    '--no-ansi',
+  ]), childEnv);
 
-  const runUrl = extractTestmoRunUrl(output, env);
-  if (runUrl) {
-    console.log(`Detected Testmo run URL: ${runUrl}`);
-    return runUrl;
+  const runId = extractTestmoRunId(createOutput);
+  if (!runId) {
+    throw new Error(`Testmo run was created but the automation run ID could not be detected from CLI output. Output: ${createOutput}`);
   }
 
-  console.warn('Testmo publish succeeded, but no specific run URL was detected from CLI output.');
-  return env.TESTMO_RUN_URL || env.TESTMO_URL || '';
+  const runUrl = buildTestmoRunUrl(runId, env);
+  console.log(`Detected Testmo run ID: ${runId}`);
+  console.log(`Detected Testmo run URL: ${runUrl}`);
+
+  try {
+    // 2) Submit Playwright JUnit result to the run.
+    runCommand(testmoCmd, withNpxPackage(testmoCmd, [
+      'automation:run:submit-thread',
+      '--instance', env.TESTMO_URL,
+      '--run-id', runId,
+      '--results', junitFile,
+      '--no-ansi',
+    ]), childEnv);
+
+    // 3) Mark the run as completed.
+    runCommand(testmoCmd, withNpxPackage(testmoCmd, [
+      'automation:run:complete',
+      '--instance', env.TESTMO_URL,
+      '--run-id', runId,
+      '--no-ansi',
+    ]), childEnv);
+  } catch (error) {
+    console.error(`Testmo publish failed for run ${runId}. Run URL: ${runUrl}`);
+    throw error;
+  }
+
+  return runUrl;
 }
 
 function getEmailConfig(env = process.env) {
