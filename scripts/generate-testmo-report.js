@@ -1,69 +1,29 @@
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { spawnSync } = require('child_process');
 const nodemailer = require('nodemailer');
-
-function parseJunitResults(xml) {
-  const testResults = [];
-  let totalTests = 0;
-  let failures = 0;
-  let skipped = 0;
-
-  const testcaseRegex = /<testcase\b([^>]*)>/g;
-  let match;
-
-  while ((match = testcaseRegex.exec(xml)) !== null) {
-    const attrsText = match[1] || '';
-    const tagText = match[0] || '';
-    const isSelfClosing = /\/>$/.test(tagText.trim());
-    const body = isSelfClosing
-      ? ''
-      : extractBodyBetweenTags(xml, match.index + tagText.length, '</testcase>');
-
-    totalTests += 1;
-    const attrs = parseAttributes(attrsText);
-    const name = attrs.name ? attrs.name.replace(/\s+/g, ' ').trim() : 'Unnamed Test';
-
-    let status = 'Passed';
-    let remark = '-';
-
-    if (/<failure\b/i.test(body)) {
-      status = 'Failed';
-      failures += 1;
-      const msgMatch = body.match(/<failure[^>]*>([\s\S]*?)<\/failure>/i);
-      remark = msgMatch ? msgMatch[1].replace(/<[^>]+>/g, '').trim() : 'Test failed';
-    } else if (/<skipped\b/i.test(body)) {
-      status = 'Skipped';
-      skipped += 1;
-      const msgMatch = body.match(/<skipped[^>]*>([\s\S]*?)<\/skipped>/i);
-      remark = msgMatch ? msgMatch[1].replace(/<[^>]+>/g, '').trim() : 'Skipped';
-    }
-
-    testResults.push({
-      name,
-      status,
-      remark,
-      elapsed: attrs.time ? formatDuration(attrs.time) : '00:00',
-    });
-  }
-
-  return {
-    totalTests,
-    passed: totalTests - failures - skipped,
-    failed: failures,
-    skipped,
-    testResults,
-  };
-}
 
 function parseAttributes(attrText) {
   const attrs = {};
   const regex = /([\w:-]+)="([^"]*)"/g;
   let match;
-  while ((match = regex.exec(attrText)) !== null) {
-    attrs[match[1]] = match[2];
+  while ((match = regex.exec(attrText || '')) !== null) {
+    attrs[match[1]] = decodeXml(match[2]);
   }
   return attrs;
+}
+
+function decodeXml(value) {
+  return String(value || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function stripTags(value) {
+  return decodeXml(String(value || '').replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
 }
 
 function extractBodyBetweenTags(xml, startIndex, closingTag) {
@@ -78,6 +38,50 @@ function formatDuration(seconds) {
   return `${mins}:${secs}`;
 }
 
+function parseJunitResults(xml) {
+  const testResults = [];
+  const testcaseRegex = /<testcase\b([^>]*?)(\/?)>/g;
+  let match;
+
+  while ((match = testcaseRegex.exec(xml || '')) !== null) {
+    const attrs = parseAttributes(match[1] || '');
+    const fullTag = match[0] || '';
+    const isSelfClosing = /\/>$/.test(fullTag.trim());
+    const body = isSelfClosing
+      ? ''
+      : extractBodyBetweenTags(xml, match.index + fullTag.length, '</testcase>');
+
+    let status = 'Passed';
+    let remark = '-';
+
+    if (/<failure\b/i.test(body) || /<error\b/i.test(body)) {
+      status = 'Failed';
+      const msgMatch = body.match(/<(failure|error)[^>]*>([\s\S]*?)<\/\1>/i);
+      remark = msgMatch ? stripTags(msgMatch[2]) : 'Test failed';
+    } else if (/<skipped\b/i.test(body)) {
+      status = 'Skipped';
+      const msgMatch = body.match(/<skipped[^>]*>([\s\S]*?)<\/skipped>/i);
+      remark = msgMatch ? stripTags(msgMatch[1]) : 'Skipped';
+    }
+
+    testResults.push({
+      name: attrs.name ? attrs.name.replace(/\s+/g, ' ').trim() : 'Unnamed Test',
+      classname: attrs.classname || '',
+      status,
+      remark: remark || '-',
+      elapsed: attrs.time ? formatDuration(attrs.time) : '00:00',
+    });
+  }
+
+  return {
+    totalTests: testResults.length,
+    passed: testResults.filter((t) => t.status === 'Passed').length,
+    failed: testResults.filter((t) => t.status === 'Failed').length,
+    skipped: testResults.filter((t) => t.status === 'Skipped').length,
+    testResults,
+  };
+}
+
 function parseRecipients(value) {
   if (!value) return [];
   return value
@@ -86,12 +90,45 @@ function parseRecipients(value) {
     .filter(Boolean);
 }
 
-function extractTestmoRunUrl(output) {
-  const match = output.match(/https?:\/\/[^\s"'<>]+\/automation\/runs(?:\/view)?\/\d+\b/i);
-  return match ? match[0] : null;
+function trimTrailingSlash(value) {
+  return String(value || '').replace(/\/+$/, '');
 }
 
-function findTestmoCmd(env) {
+function buildTestmoRunUrl(runId, env = process.env) {
+  if (!runId || !env.TESTMO_URL) return null;
+  return `${trimTrailingSlash(env.TESTMO_URL)}/automation/runs/view/${runId}`;
+}
+
+function extractTestmoRunUrl(output, env = process.env) {
+  const text = String(output || '');
+
+  const urlMatch = text.match(/https?:\/\/[^\s"'<>]+\/automation\/runs(?:\/view)?\/\d+\b/i);
+  if (urlMatch) {
+    let url = urlMatch[0].replace(/[)\].,;]+$/, '');
+    if (/\/automation\/runs\/\d+\b/i.test(url) && !/\/automation\/runs\/view\/\d+\b/i.test(url)) {
+      url = url.replace('/automation/runs/', '/automation/runs/view/');
+    }
+    return url;
+  }
+
+  const idPatterns = [
+    /automation\s+run\s+(?:id\s*)?[:#]?\s*(\d{1,10})/i,
+    /run\s+id\s*[:#]?\s*(\d{1,10})/i,
+    /created\s+run\s*[:#]?\s*(\d{1,10})/i,
+    /run_id["'\s:=]+(\d{1,10})/i,
+  ];
+
+  for (const pattern of idPatterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      return buildTestmoRunUrl(match[1], env);
+    }
+  }
+
+  return null;
+}
+
+function findTestmoCmd(env = process.env) {
   if (env.TESTMO_CMD && fs.existsSync(env.TESTMO_CMD)) {
     return env.TESTMO_CMD;
   }
@@ -101,40 +138,54 @@ function findTestmoCmd(env) {
       path.join(env.NPM_GLOBAL_PREFIX, 'testmo.cmd'),
       path.join(env.NPM_GLOBAL_PREFIX, 'bin', 'testmo.cmd'),
       path.join(env.NPM_GLOBAL_PREFIX, 'node_modules', '.bin', 'testmo.cmd'),
-      path.join(env.NPM_GLOBAL_PREFIX, 'node_modules', '@testmo', 'testmo-cli', 'bin', 'testmo.cmd'),
-      path.join(env.NPM_GLOBAL_PREFIX, 'node_modules', '@testmo', 'testmo-cli', 'bin', 'testmo'),
     ];
 
     for (const candidate of candidates) {
-      if (candidate && fs.existsSync(candidate)) {
-        return candidate;
-      }
+      if (fs.existsSync(candidate)) return candidate;
     }
   }
 
   return 'npx';
 }
 
-function extendPathWithGlobalPrefix(env) {
-  const newEnv = { ...env };
-  if (env.NPM_GLOBAL_PREFIX) {
-    const separator = process.platform === 'win32' ? ';' : ':';
-    const npmBin = path.join(env.NPM_GLOBAL_PREFIX, 'bin');
-    const npmDotBin = path.join(env.NPM_GLOBAL_PREFIX, 'node_modules', '.bin');
-    const entries = [npmBin, npmDotBin].filter(Boolean);
-    const currentPath = env.PATH || process.env.PATH || '';
-    const extra = entries.filter((entry) => !currentPath.includes(entry)).join(separator);
-    if (extra) {
-      newEnv.PATH = `${extra}${separator}${currentPath}`;
-    }
+function quoteArg(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_./:=@-]+$/.test(text)) return text;
+  return `"${text.replace(/"/g, '\\"')}"`;
+}
+
+function runCommand(command, args, env = process.env) {
+  const commandLine = [quoteArg(command), ...args.map(quoteArg)].join(' ');
+  const result = spawnSync(commandLine, {
+    shell: true,
+    env,
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+
+  const output = `${result.stdout || ''}${result.stderr || ''}`;
+  if (output.trim()) console.log(output.trim());
+
+  if (result.error) {
+    throw result.error;
   }
-  return newEnv;
+
+  if (result.status !== 0) {
+    throw new Error(`Command failed with exit code ${result.status}: ${commandLine}`);
+  }
+
+  return output;
 }
 
 function publishTestmoResults(env = process.env) {
-  if (!env.TESTMO_PROJECT_ID || !env.TESTMO_URL || !env.TESTMO_SOURCE || !env.JUNIT_FILE) {
-    console.warn('Skipping Testmo publish: TESTMO_PROJECT_ID, TESTMO_URL, TESTMO_SOURCE, or JUNIT_FILE is missing.');
-    return null;
+  const junitFile = env.JUNIT_FILE || path.join('test-results', 'junit.xml');
+
+  if (!env.TESTMO_TOKEN) {
+    throw new Error('Missing TESTMO_TOKEN. Add Jenkins secret text credential with id: testmo-api-key.');
+  }
+
+  if (!fs.existsSync(junitFile)) {
+    throw new Error(`JUnit file not found: ${junitFile}`);
   }
 
   const testmoCmd = findTestmoCmd(env);
@@ -142,64 +193,41 @@ function publishTestmoResults(env = process.env) {
     'automation:run:submit',
     '--instance', env.TESTMO_URL,
     '--project-id', env.TESTMO_PROJECT_ID,
-    '--name', `${env.TESTMO_RUN_NAME || 'Automation Run'} - Build ${env.BUILD_NUMBER || env.BUILD_ID || 'local'}`,
+    '--name', `${env.TESTMO_RUN_NAME || 'Automation Run'} - Build #${env.BUILD_NUMBER || env.BUILD_ID || 'local'}`,
     '--source', env.TESTMO_SOURCE,
-    '--results', env.JUNIT_FILE,
+    '--results', junitFile,
   ];
 
   if (testmoCmd === 'npx') {
     args.unshift('@testmo/testmo-cli');
   }
 
-  const envWithPath = extendPathWithGlobalPrefix(env);
-  const childEnv = {
+  console.log('Publishing results to Testmo...');
+  console.log(`Using Testmo command: ${testmoCmd}`);
+  console.log(`JUnit file: ${junitFile}`);
+  console.log('TESTMO_TOKEN: ***HIDDEN***');
+
+  const output = runCommand(testmoCmd, args, {
     ...process.env,
-    ...envWithPath,
-    TESTMO_TOKEN: env.TESTMO_TOKEN || process.env.TESTMO_TOKEN,
-  };
+    ...env,
+  });
 
-  try {
-    console.log('Publishing results to Testmo...');
-    console.log(`Using Testmo command: ${testmoCmd}`);
-    console.log(`Using TESTMO_TOKEN: ${childEnv.TESTMO_TOKEN ? '***HIDDEN***' : 'MISSING'}`);
-    if (!childEnv.TESTMO_TOKEN) {
-      throw new Error('Missing TESTMO_TOKEN. Please provide Testmo API token via environment or Jenkins credentials.');
-    }
-
-    const isWindows = process.platform === 'win32';
-    const execCommand = isWindows ? 'cmd.exe' : testmoCmd;
-    const execArgs = isWindows ? ['/c', testmoCmd, ...args] : args;
-
-    const output = execFileSync(execCommand, execArgs, {
-      env: childEnv,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    console.log(output);
-    const url = extractTestmoRunUrl(output);
-    if (url) {
-      console.log(`Detected Testmo run URL: ${url}`);
-      return url;
-    }
-
-    console.warn('Testmo publish succeeded, but no run URL was detected in output.');
-    return env.TESTMO_RUN_URL || env.TESTMO_URL;
-  } catch (error) {
-    console.error('Testmo publish failed:', error.message || error);
-    console.error(error.stdout ? error.stdout.toString() : '');
-    console.error(error.stderr ? error.stderr.toString() : '');
-    throw new Error('Failed to publish results to Testmo.');
+  const runUrl = extractTestmoRunUrl(output, env);
+  if (runUrl) {
+    console.log(`Detected Testmo run URL: ${runUrl}`);
+    return runUrl;
   }
+
+  console.warn('Testmo publish succeeded, but no specific run URL was detected from CLI output.');
+  return env.TESTMO_RUN_URL || env.TESTMO_URL || '';
 }
 
 function getEmailConfig(env = process.env) {
   return {
-    from: env.REPORT_EMAIL_FROM || env.DEFAULT_FROM || 'jenkins@company.com',
+    from: env.REPORT_EMAIL_FROM || env.SMTP_USER || 'jenkins@company.com',
     to: parseRecipients(env.REPORT_EMAIL_TO || env.EMAIL_TO),
     cc: parseRecipients(env.REPORT_EMAIL_CC || env.EMAIL_CC),
-    subject: env.REPORT_EMAIL_SUBJECT || env.EMAIL_SUBJECT || 'Automation Test Report',
-    bodyFile: env.REPORT_EMAIL_BODY_FILE || env.EMAIL_BODY_FILE || '',
+    baseSubject: env.REPORT_EMAIL_SUBJECT || env.EMAIL_SUBJECT || 'Automation Test Report',
   };
 }
 
@@ -209,34 +237,38 @@ function buildReportData({
   environment,
   executionDate,
   duration,
-  testResults,
+  parsed,
   testmoUrl,
-  subjectPrefix,
+  jenkinsBuildUrl,
+  emailBaseSubject,
+  publishError,
 }) {
   const summary = {
-    totalTestCases: testResults.length,
-    passed: testResults.filter((t) => t.status === 'Passed').length,
-    failed: testResults.filter((t) => t.status === 'Failed').length,
-    skipped: testResults.filter((t) => t.status === 'Skipped').length,
+    totalTestCases: parsed.totalTests,
+    passed: parsed.passed,
+    failed: parsed.failed,
+    skipped: parsed.skipped,
   };
 
-  const resolvedPrefix = subjectPrefix || (summary.failed > 0 ? '🔴 [FAILED]' : '🟢 [PASSED]');
+  const resolvedPrefix = summary.failed > 0 ? '🔴 [FAILED]' : '🟢 [PASSED]';
 
   return {
-    subject: `${resolvedPrefix} ${projectName} Automation Report | Build #${buildNumber}`,
+    subject: `${resolvedPrefix} ${emailBaseSubject} | Build #${buildNumber}`,
     projectName,
     buildNumber,
     environment,
     executionDate,
     duration,
     summary,
-    testResults,
+    testResults: parsed.testResults,
     testmoUrl,
+    jenkinsBuildUrl,
+    publishError,
   };
 }
 
 function escapeHtml(value) {
-  return String(value)
+  return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -244,48 +276,38 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-function renderReport(data) {
+function renderTextReport(data) {
   const lines = [];
-  lines.push('Subject');
-  lines.push('');
-  lines.push(`${data.subject}`);
-  lines.push('');
-  lines.push('---');
+  lines.push(data.subject);
   lines.push('');
   lines.push('Hello Team,');
   lines.push('');
   lines.push('The automation execution has been completed.');
   lines.push('');
-  lines.push('### Execution Information');
+  lines.push('Execution Information');
+  lines.push(`Project          : ${data.projectName}`);
+  lines.push(`Build            : ${data.buildNumber}`);
+  lines.push(`Environment      : ${data.environment}`);
+  lines.push(`Execution Date   : ${data.executionDate}`);
+  lines.push(`Duration         : ${data.duration}`);
+  lines.push(`Total Test Cases : ${data.summary.totalTestCases}`);
+  lines.push(`Passed           : ${data.summary.passed}`);
+  lines.push(`Failed           : ${data.summary.failed}`);
+  lines.push(`Skipped          : ${data.summary.skipped}`);
   lines.push('');
-  lines.push(`ItemValueProject${data.projectName}`);
-  lines.push(`BuildBuild ${data.buildNumber}`);
-  lines.push(`Environment${data.environment}`);
-  lines.push(`Execution Date${data.executionDate}`);
-  lines.push(`Duration${data.duration}`);
-  lines.push(`Total Test Cases${data.summary.totalTestCases}`);
-  lines.push(`Passed${data.summary.passed}`);
-  lines.push(`Failed${data.summary.failed}`);
-  lines.push(`Skipped${data.summary.skipped}`);
+  lines.push(`Testmo Report    : ${data.testmoUrl || '-'}`);
+  if (data.jenkinsBuildUrl) lines.push(`Jenkins Build    : ${data.jenkinsBuildUrl}`);
+  if (data.publishError) lines.push(`Testmo Publish   : FAILED - ${data.publishError}`);
   lines.push('');
-  lines.push('### Testmo Report');
-  lines.push('');
-  lines.push(`🔗 ${data.testmoUrl}`);
-  lines.push('');
-  lines.push('## Test Case Result');
-  lines.push('');
-  lines.push('NoTest CaseStatusRemarkElapsed');
+  lines.push('Test Case Result');
+  lines.push('No | Test Case | Status | Remark | Elapsed');
 
   data.testResults.forEach((test, index) => {
-    const icon = test.status === 'Failed' ? '🔴' : test.status === 'Skipped' ? '🟡' : '🟢';
-    const remark = test.remark || '-';
-    const elapsed = test.elapsed || '00:00';
-    lines.push(`${index + 1}. ${test.name} ${icon} ${test.status} ${remark} ${elapsed}`);
+    lines.push(`${index + 1} | ${test.name} | ${test.status} | ${test.remark || '-'} | ${test.elapsed || '00:00'}`);
   });
 
   lines.push('');
   lines.push('Regards,');
-  lines.push('');
   lines.push('Automation Bot');
 
   return lines.join('\n');
@@ -294,42 +316,54 @@ function renderReport(data) {
 function renderHtmlReport(data) {
   const rows = data.testResults.map((test, index) => {
     const icon = test.status === 'Failed' ? '🔴' : test.status === 'Skipped' ? '🟡' : '🟢';
-    const statusColor = test.status === 'Failed' ? '#e74c3c' : test.status === 'Skipped' ? '#f1c40f' : '#2ecc71';
-    return `<tr style="border-bottom:1px solid #e0e0e0">
-      <td style="padding:8px;vertical-align:top">${index + 1}</td>
-      <td style="padding:8px;vertical-align:top">${escapeHtml(test.name)}</td>
-      <td style="padding:8px;vertical-align:top;color:${statusColor};font-weight:600">${icon} ${escapeHtml(test.status)}</td>
-      <td style="padding:8px;vertical-align:top">${escapeHtml(test.remark || '-')}</td>
-      <td style="padding:8px;vertical-align:top">${escapeHtml(test.elapsed || '00:00')}</td>
+    const color = test.status === 'Failed' ? '#d93025' : test.status === 'Skipped' ? '#b06000' : '#188038';
+
+    return `<tr>
+      <td style="padding:8px;border:1px solid #ddd;">${index + 1}</td>
+      <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(test.name)}</td>
+      <td style="padding:8px;border:1px solid #ddd;color:${color};font-weight:700;">${icon} ${escapeHtml(test.status)}</td>
+      <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(test.remark || '-')}</td>
+      <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(test.elapsed || '00:00')}</td>
     </tr>`;
   }).join('');
 
-  const testmoLink = data.testmoUrl ? `<a href="${escapeHtml(data.testmoUrl)}">${escapeHtml(data.testmoUrl)}</a>` : '-';
+  const testmoLink = data.testmoUrl
+    ? `<a href="${escapeHtml(data.testmoUrl)}">${escapeHtml(data.testmoUrl)}</a>`
+    : '-';
+
+  const jenkinsLink = data.jenkinsBuildUrl
+    ? `<a href="${escapeHtml(data.jenkinsBuildUrl)}">${escapeHtml(data.jenkinsBuildUrl)}</a>`
+    : '-';
+
+  const publishWarning = data.publishError
+    ? `<p style="color:#d93025;"><b>Testmo publish failed:</b> ${escapeHtml(data.publishError)}</p>`
+    : '';
 
   return `<!doctype html>
 <html>
   <body style="font-family:Arial,Helvetica,sans-serif;color:#333;line-height:1.5;">
-    <h2 style="margin-bottom:0.2em;">${escapeHtml(data.subject)}</h2>
+    <h2 style="margin-bottom:8px;">${escapeHtml(data.subject)}</h2>
+    <p>Hello Team,</p>
     <p>The automation execution has been completed.</p>
+    ${publishWarning}
 
     <h3>Execution Information</h3>
-    <table style="border-collapse:collapse;width:100%;max-width:700px;margin-bottom:16px;">
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Project</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.projectName)}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Build</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.buildNumber)}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Environment</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.environment)}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Execution Date</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.executionDate)}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Duration</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.duration)}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Total Test Cases</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.totalTestCases}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Passed</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.passed}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Failed</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.failed}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:600;">Skipped</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.skipped}</td></tr>
+    <table style="border-collapse:collapse;width:100%;max-width:760px;">
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Project</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.projectName)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Build</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.buildNumber)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Environment</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.environment)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Execution Date</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.executionDate)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Duration</td><td style="padding:8px;border:1px solid #ddd;">${escapeHtml(data.duration)}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Total Test Cases</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.totalTestCases}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Passed</td><td style="padding:8px;border:1px solid #ddd;color:#188038;font-weight:700;">${data.summary.passed}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Failed</td><td style="padding:8px;border:1px solid #ddd;color:#d93025;font-weight:700;">${data.summary.failed}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Skipped</td><td style="padding:8px;border:1px solid #ddd;">${data.summary.skipped}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Testmo Report</td><td style="padding:8px;border:1px solid #ddd;">${testmoLink}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;font-weight:700;">Jenkins Build</td><td style="padding:8px;border:1px solid #ddd;">${jenkinsLink}</td></tr>
     </table>
 
-    <h3>Testmo Report</h3>
-    <p>${testmoLink}</p>
-
     <h3>Test Case Result</h3>
-    <table style="border-collapse:collapse;width:100%;max-width:900px;">
+    <table style="border-collapse:collapse;width:100%;max-width:980px;">
       <thead>
         <tr style="background:#f7f7f7;text-align:left;">
           <th style="padding:10px;border:1px solid #ddd;">No</th>
@@ -339,9 +373,7 @@ function renderHtmlReport(data) {
           <th style="padding:10px;border:1px solid #ddd;">Elapsed</th>
         </tr>
       </thead>
-      <tbody>
-        ${rows}
-      </tbody>
+      <tbody>${rows}</tbody>
     </table>
 
     <p>Regards,<br/>Automation Bot</p>
@@ -354,96 +386,117 @@ function writeReportFile(outputPath, content) {
   fs.writeFileSync(outputPath, content, 'utf8');
 }
 
-async function sendEmailReport(content, data, env = process.env) {
-  const emailConfig = getEmailConfig(env);
-  if (!emailConfig.to.length) {
-    console.warn('No email recipients configured; skipping email send.');
-    return;
+function createTransport(env = process.env) {
+  const isGmail = /(^|\.)gmail\.com$/i.test(env.SMTP_HOST || '') || /@gmail\.com$/i.test(env.SMTP_USER || '');
+  const pass = isGmail ? String(env.SMTP_PASS || '').replace(/\s+/g, '') : env.SMTP_PASS;
+
+  if (!env.SMTP_USER || !pass) {
+    throw new Error('SMTP_USER or SMTP_PASS is missing. Add gmail-app-password credential in Jenkins.');
   }
 
-  const useSecure = env.SMTP_SECURE === 'true';
-  const transporter = nodemailer.createTransport({
+  if (isGmail) {
+    return nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: env.SMTP_USER,
+        pass,
+      },
+      logger: env.SMTP_DEBUG === 'true',
+      debug: env.SMTP_DEBUG === 'true',
+    });
+  }
+
+  const secure = env.SMTP_SECURE === 'true';
+  return nodemailer.createTransport({
     host: env.SMTP_HOST,
     port: Number(env.SMTP_PORT || 587),
-    secure: useSecure,
-    requireTLS: !useSecure,
-    auth: env.SMTP_USER && env.SMTP_PASS ? {
+    secure,
+    requireTLS: !secure,
+    auth: {
       user: env.SMTP_USER,
-      pass: env.SMTP_PASS,
-      method: 'LOGIN',
-    } : undefined,
-    tls: {
-      rejectUnauthorized: false,
+      pass,
     },
-    logger: !!env.SMTP_DEBUG,
-    debug: !!env.SMTP_DEBUG,
+    tls: {
+      rejectUnauthorized: env.SMTP_TLS_REJECT_UNAUTHORIZED !== 'false',
+    },
+    logger: env.SMTP_DEBUG === 'true',
+    debug: env.SMTP_DEBUG === 'true',
   });
+}
 
-  console.log(`SMTP host=${env.SMTP_HOST} port=${env.SMTP_PORT} secure=${useSecure}`);
-  console.log(`Email from=${emailConfig.from} to=${emailConfig.to.join(', ')} cc=${emailConfig.cc.join(', ')}`);
+async function sendEmailReport(textContent, htmlContent, data, outputPath, env = process.env) {
+  const emailConfig = getEmailConfig(env);
 
-  try {
-    await transporter.verify();
-  } catch (error) {
-    throw new Error(`SMTP connection failed: ${error.message || error}`);
+  if (!emailConfig.to.length) {
+    throw new Error('No email recipients configured. Set REPORT_EMAIL_TO.');
   }
 
-  const message = {
+  const transporter = createTransport(env);
+
+  console.log(`Email from=${emailConfig.from} to=${emailConfig.to.join(', ')} cc=${emailConfig.cc.join(', ') || '-'}`);
+
+  await transporter.verify();
+
+  const attachments = [];
+  if (env.JUNIT_FILE && fs.existsSync(env.JUNIT_FILE)) {
+    attachments.push({ filename: path.basename(env.JUNIT_FILE), path: env.JUNIT_FILE });
+  }
+  if (outputPath && fs.existsSync(outputPath)) {
+    attachments.push({ filename: path.basename(outputPath), path: outputPath });
+  }
+
+  const info = await transporter.sendMail({
     from: emailConfig.from,
     to: emailConfig.to.join(','),
-    cc: emailConfig.cc.join(','),
-    subject: emailConfig.subject,
-    text: content,
-    html: renderHtmlReport(data),
-  };
+    cc: emailConfig.cc.join(',') || undefined,
+    subject: data.subject,
+    text: textContent,
+    html: htmlContent,
+    attachments,
+  });
 
-  const info = await transporter.sendMail(message);
-  console.log(`Email sent to ${emailConfig.to.join(', ')}. MessageId: ${info.messageId}`);
+  console.log(`Email sent successfully. MessageId: ${info.messageId}`);
+}
+
+function getExistingJunitPath(env = process.env) {
+  const cwd = process.cwd();
+  const candidates = [
+    env.JUNIT_FILE,
+    path.join(cwd, 'test-results', 'junit.xml'),
+    path.join(cwd, 'results', 'test-results.xml'),
+    path.join(cwd, 'test-results', 'test-results.xml'),
+  ].filter(Boolean);
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
 }
 
 async function main() {
   const cwd = process.cwd();
-  const junitCandidates = [
-    process.env.JUNIT_FILE,
-    path.join(cwd, 'results', 'test-results.xml'),
-    path.join(cwd, 'test-results', 'junit.xml'),
-    path.join(cwd, 'test-results', 'test-results.xml'),
-  ].filter(Boolean);
-
-  const junitPath = junitCandidates.find((candidate) => fs.existsSync(candidate)) || junitCandidates[0] || path.join(cwd, 'results', 'test-results.xml');
+  const junitPath = getExistingJunitPath(process.env);
   const outputPath = process.env.TESTMO_REPORT_OUTPUT || path.join(cwd, 'test-results', 'testmo-report.txt');
-
-  const projectName = process.env.TESTMO_PROJECT_NAME || process.env.JOB_NAME || 'Water Treatment';
-  const buildNumber = process.env.BUILD_NUMBER || process.env.BUILD_ID || 'local';
-  const environment = process.env.TESTMO_ENVIRONMENT || process.env.ENVIRONMENT || process.env.NODE_ENV || 'UAT';
-  const executionDate = process.env.TESTMO_EXECUTION_DATE || process.env.BUILD_TIMESTAMP || new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' });
-  const duration = process.env.TESTMO_DURATION || process.env.TEST_DURATION || '00:00:00';
-  const testmoUrl = process.env.TESTMO_RUN_URL || process.env.TESTMO_URL || 'https://yourcompany.testmo.net/automation/runs/2541';
-
-  if (!process.env.TESTMO_RUN_URL && process.env.TESTMO_URL) {
-    console.warn('WARNING: TESTMO_RUN_URL is not configured. The report will use TESTMO_URL root instead of a specific run view URL.');
-    console.warn('Set TESTMO_RUN_URL to the actual run view link, e.g. https://test525252.testmo.net/automation/runs/view/9');
-  }
-
-  console.log(`Default Testmo URL: ${testmoUrl}`);
-
-  if (!fs.existsSync(junitPath)) {
-    console.warn(`JUnit file not found at ${junitPath}; creating empty report.`);
-  }
 
   const xml = fs.existsSync(junitPath) ? fs.readFileSync(junitPath, 'utf8') : '<testsuites />';
   const parsed = parseJunitResults(xml);
-  const subjectPrefix = process.env.REPORT_SUBJECT_PREFIX || (parsed.failed > 0 ? '🔴 [FAILED]' : '🟢 [PASSED]');
 
-  let resolvedTestmoUrl = testmoUrl;
+  const projectName = process.env.TESTMO_PROJECT_NAME || process.env.JOB_NAME || 'Automation Project';
+  const buildNumber = process.env.BUILD_NUMBER || process.env.BUILD_ID || 'local';
+  const environment = process.env.TESTMO_ENVIRONMENT || process.env.ENVIRONMENT || 'UAT';
+  const executionDate = process.env.TESTMO_EXECUTION_DATE || new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' });
+  const duration = process.env.TESTMO_DURATION || process.env.TEST_DURATION || '00:00:00';
+  const emailBaseSubject = getEmailConfig(process.env).baseSubject;
+
+  let testmoUrl = process.env.TESTMO_RUN_URL || '';
+  let publishError = '';
+
   try {
-    const publishedUrl = publishTestmoResults(process.env);
-    if (publishedUrl) {
-      resolvedTestmoUrl = publishedUrl;
-    }
+    testmoUrl = publishTestmoResults({
+      ...process.env,
+      JUNIT_FILE: junitPath,
+    });
   } catch (error) {
-    console.error('Testmo publish failed. Email will still be sent with the default or provided Testmo URL.');
-    console.error(error.message || error);
+    publishError = error.message || String(error);
+    console.error(`Testmo publish failed: ${publishError}`);
+    testmoUrl = process.env.TESTMO_RUN_URL || process.env.TESTMO_URL || '';
   }
 
   const data = buildReportData({
@@ -452,39 +505,42 @@ async function main() {
     environment,
     executionDate,
     duration,
-    testResults: parsed.testResults,
-    testmoUrl: resolvedTestmoUrl,
-    subjectPrefix,
+    parsed,
+    testmoUrl,
+    jenkinsBuildUrl: process.env.BUILD_URL || '',
+    emailBaseSubject,
+    publishError,
   });
 
-  const content = renderReport(data);
-  writeReportFile(outputPath, content);
-  console.log(`Generated Testmo report: ${outputPath}`);
+  const textContent = renderTextReport(data);
+  const htmlContent = renderHtmlReport(data);
+
+  writeReportFile(outputPath, textContent);
+  console.log(`Generated email report file: ${outputPath}`);
 
   if (process.env.SEND_EMAIL === 'true') {
-    try {
-      await sendEmailReport(content, data);
-    } catch (error) {
-      console.error('Failed to send email:', error.message || error);
-      console.error(error);
-    }
+    await sendEmailReport(textContent, htmlContent, data, outputPath, process.env);
   } else {
     console.log('SEND_EMAIL is not true; skipping email send.');
+  }
+
+  if (publishError && process.env.FAIL_ON_TESTMO_ERROR !== 'false') {
+    throw new Error(`Testmo publish failed after email step: ${publishError}`);
   }
 }
 
 if (require.main === module) {
   main().catch((error) => {
-    console.error(error);
+    console.error(error.message || error);
     process.exit(1);
   });
 }
 
 module.exports = {
   parseJunitResults,
-  buildReportData,
-  renderReport,
-  writeReportFile,
+  extractTestmoRunUrl,
+  buildTestmoRunUrl,
+  renderTextReport,
+  renderHtmlReport,
   parseRecipients,
-  getEmailConfig,
 };
