@@ -263,6 +263,12 @@ async function sendEmailReport(content, data, env = process.env) {
     } : undefined,
   });
 
+  try {
+    await transporter.verify();
+  } catch (error) {
+    throw new Error(`SMTP connection failed: ${error.message || error}`);
+  }
+
   const message = {
     from: emailConfig.from,
     to: emailConfig.to.join(','),
@@ -272,8 +278,8 @@ async function sendEmailReport(content, data, env = process.env) {
     html: renderHtmlReport(data),
   };
 
-  await transporter.sendMail(message);
-  console.log(`Email sent to ${emailConfig.to.join(', ')}`);
+  const info = await transporter.sendMail(message);
+  console.log(`Email sent to ${emailConfig.to.join(', ')}. MessageId: ${info.messageId}`);
 }
 
 async function main() {
@@ -293,7 +299,7 @@ async function main() {
   const environment = process.env.TESTMO_ENVIRONMENT || process.env.ENVIRONMENT || process.env.NODE_ENV || 'UAT';
   const executionDate = process.env.TESTMO_EXECUTION_DATE || process.env.BUILD_TIMESTAMP || new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' });
   const duration = process.env.TESTMO_DURATION || process.env.TEST_DURATION || '00:00:00';
-  const testmoUrl = process.env.TESTMO_URL || process.env.TESTMO_RUN_URL || 'https://yourcompany.testmo.net/automation/runs/2541';
+  const testmoUrl = process.env.TESTMO_RUN_URL || process.env.TESTMO_URL || 'https://yourcompany.testmo.net/automation/runs/2541';
 
   if (!fs.existsSync(junitPath)) {
     console.warn(`JUnit file not found at ${junitPath}; creating empty report.`);
@@ -318,7 +324,12 @@ async function main() {
   console.log(`Generated Testmo report: ${outputPath}`);
 
   if (process.env.SEND_EMAIL === 'true') {
-    await sendEmailReport(content, data);
+    try {
+      await sendEmailReport(content, data);
+    } catch (error) {
+      console.error('Failed to send email:', error.message || error);
+      console.error(error);
+    }
   }
 }
 
